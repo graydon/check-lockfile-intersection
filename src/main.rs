@@ -18,59 +18,69 @@ struct Spec {
 struct Args {
     spec_a: Spec,
     spec_b: Spec,
+    verbose: bool,
+}
+
+fn comma_separated_list(s: &Option<String>) -> Vec<String> {
+    if let Some(s) = s {
+        s.split(',').map(|x| x.to_string()).collect()
+    } else {
+        Vec::new()
+    }
 }
 
 impl Args {
     fn parse() -> Result<Self, String> {
-        let args = std::env::args().collect::<Vec<String>>();
-        let mut iter = args.iter().skip(1);
-        let mut res = Args::default();
-        while let Some(arg) = iter.next() {
-            match arg.as_str() {
-                "--pkg-hash-a" => {
-                    res.spec_a.pkg_hash = iter.next().cloned();
-                }
-                "--pkg-hash-b" => {
-                    res.spec_b.pkg_hash = iter.next().cloned();
-                }
-                "--pkg-name-a" => {
-                    res.spec_a.pkg_name = iter.next().cloned();
-                }
-                "--pkg-name-b" => {
-                    res.spec_b.pkg_name = iter.next().cloned();
-                }
-                "--exclude-pkg-a" => {
-                    res.spec_a
-                        .exclude_pkgs
-                        .insert(iter.next().cloned().unwrap());
-                }
-                "--exclude-pkg-b" => {
-                    res.spec_b
-                        .exclude_pkgs
-                        .insert(iter.next().cloned().unwrap());
-                }
-                _ => {
-                    if res.spec_a.src.is_empty() {
-                        res.spec_a.src = arg.clone();
-                    } else if res.spec_b.src.is_empty() {
-                        res.spec_b.src = arg.clone();
-                    } else {
-                        return Err(format!("Unexpected argument: {}", arg));
-                    }
-                }
-            }
-        }
-        if res.spec_a.src.is_empty() || res.spec_b.src.is_empty() {
-            return Err("Missing lockfile source arguments".to_string());
-        }
-        Ok(res)
+        let mut args = Args::default();
+        let flags = xflags::parse_or_exit! {
+            /// Limit first lockfile to package tree rooted at hash (git commit or crate checksum)
+            optional --pkg-hash-a hash_a: String
+            /// Limit second lockfile to package tree rooted at hash (git commit or crate checksum)
+            optional --pkg-hash-b hash_b: String
+            /// Limit first lockfile to package tree rooted at package name
+            optional --pkg-name-a name_a: String
+            /// Limit second lockfile to package tree rooted at package name
+            optional --pkg-name-b name_b: String
+            /// Comma-separated list of packages to exclude from first lockfile
+            optional --exclude-pkg-a exclude_a: String
+            /// Comma-separated list of packages to exclude from second lockfile
+            optional --exclude-pkg-b exclude_b: String
+            /// First lockfile (URL or path)
+            required lockfile_a: String
+            /// Second lockfile (URL or path)
+            required lockfile_b: String
+            /// Print more details while running
+            optional --verbose
+        };
+        args.spec_a.pkg_hash = flags.pkg_hash_a;
+        args.spec_b.pkg_hash = flags.pkg_hash_b;
+        args.spec_a.pkg_name = flags.pkg_name_a;
+        args.spec_b.pkg_name = flags.pkg_name_b;
+        args.spec_a.exclude_pkgs = comma_separated_list(&flags.exclude_pkg_a)
+            .into_iter()
+            .collect();
+        args.spec_b.exclude_pkgs = comma_separated_list(&flags.exclude_pkg_b)
+            .into_iter()
+            .collect();
+        args.spec_a.src = flags.lockfile_a;
+        args.spec_b.src = flags.lockfile_b;
+        args.verbose = flags.verbose;
+        Ok(args)
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    NameIntersection,
+    NameAndVersionIntersection,
 }
 
 struct State {
     spec: Spec,
     lockfile: Lockfile,
-    packages: BTreeMap<Name, Package>,
+    packages: BTreeMap<Name, (Package, Vec<Package>)>,
+    phase: Phase,
+    verbose: bool,
 }
 
 fn load_lockfile(src: &str) -> Result<Lockfile, String> {
@@ -120,33 +130,62 @@ fn package_matches_hash(pkg: &cargo_lock::Package, hash: &str) -> bool {
     false
 }
 
+fn path_to_str(path: &Vec<Package>) -> String {
+    path.iter()
+        .map(|p| format!("{}@{}", p.name, p.version))
+        .collect::<Vec<_>>()
+        .join(" -> ")
+}
+
 impl State {
-    fn new(spec: Spec) -> Result<Self, String> {
+    fn new(spec: Spec, verbose: bool) -> Result<Self, String> {
         let lockfile = load_lockfile(&spec.src)?;
         Ok(State {
             spec,
             lockfile,
+            phase: Phase::NameIntersection,
             packages: BTreeMap::new(),
+            verbose,
         })
     }
 
-    fn try_insert_package(&mut self, package: &Package) -> Result<bool, String> {
+    fn try_insert_package(
+        &mut self,
+        package: &Package,
+        path: &Vec<Package>,
+    ) -> Result<bool, String> {
         if let Some(existing) = self.packages.get(&package.name) {
-            if existing.version != package.version {
+            if self.phase == Phase::NameAndVersionIntersection
+                && existing.0.version != package.version
+            {
                 return Err(format!(
-                    "Package {} has multiple versions in lockfile {}: {} and {}",
-                    package.name, self.spec.src, existing.version, package.version
+                    "Package {} has multiple versions in lockfile {}: {} and {}, path: {}",
+                    package.name,
+                    self.spec.src,
+                    existing.0.version,
+                    package.version,
+                    path_to_str(path)
                 ));
             }
             Ok(false)
         } else {
-            println!("{} {} {}", self.spec.src, package.name, package.version);
-            self.packages.insert(package.name.clone(), package.clone());
+            if self.verbose {
+                println!(
+                    "found {} {} {}",
+                    self.spec.src, package.name, package.version
+                );
+            }
+            self.packages
+                .insert(package.name.clone(), (package.clone(), path.clone()));
             Ok(true)
         }
     }
 
-    fn add_all_dependencies_recursive(&mut self, package: &Package) -> Result<(), String> {
+    fn add_all_dependencies_recursive(
+        &mut self,
+        package: &Package,
+        path: &mut Vec<Package>,
+    ) -> Result<(), String> {
         for dep in package.dependencies.iter() {
             if self.spec.exclude_pkgs.contains(dep.name.as_str()) {
                 continue;
@@ -158,9 +197,11 @@ impl State {
                 .cloned()
                 .find(|p| dep.matches(p));
             if let Some(dep_pkg) = dep_pkg {
-                if self.try_insert_package(&dep_pkg)? {
-                    self.add_all_dependencies_recursive(&dep_pkg)?;
+                path.push(dep_pkg.clone());
+                if self.try_insert_package(&dep_pkg, &path)? {
+                    self.add_all_dependencies_recursive(&dep_pkg, path)?;
                 }
+                path.pop();
             }
         }
         Ok(())
@@ -183,8 +224,10 @@ impl State {
                 }
             }
 
-            self.packages.insert(package.name.clone(), package.clone());
-            self.add_all_dependencies_recursive(package)?;
+            let mut path = vec![package.clone()];
+            self.packages
+                .insert(package.name.clone(), (package.clone(), path.clone()));
+            self.add_all_dependencies_recursive(package, &mut path)?;
             return Ok(());
         }
         Err(format!(
@@ -201,8 +244,11 @@ impl State {
             .cloned()
             .filter(|x| !self.spec.exclude_pkgs.contains(x.name.as_str()))
             .collect::<Vec<_>>();
+        let mut path = Vec::new();
         for package in all_packages {
-            self.try_insert_package(&package)?;
+            path.push(package.clone());
+            self.try_insert_package(&package, &mut path)?;
+            path.pop();
         }
         Ok(())
     }
@@ -224,42 +270,74 @@ struct Program {
 impl Program {
     fn new() -> Result<Self, String> {
         let args = Args::parse()?;
-        let state_a = State::new(args.spec_a)?;
-        let state_b = State::new(args.spec_b)?;
+        let state_a = State::new(args.spec_a, args.verbose)?;
+        let state_b = State::new(args.spec_b, args.verbose)?;
         Ok(Program { state_a, state_b })
     }
 
-    fn run(&mut self) -> Result<(), String> {
+    fn add_packages_and_calculate_intesection(&mut self) -> Result<BTreeSet<Name>, String> {
         self.state_a.add_packages()?;
         self.state_b.add_packages()?;
         let package_names_a = self.state_a.packages.keys().collect::<BTreeSet<_>>();
         let package_names_b = self.state_b.packages.keys().collect::<BTreeSet<_>>();
         let intersection = package_names_a
             .intersection(&package_names_b)
-            .collect::<BTreeSet<_>>();
-        println!(
-            "{} packages in lockfile A: {}",
-            package_names_a.len(),
-            self.state_a.spec.src
-        );
-        println!(
-            "{} packages in lockfile B: {}",
-            package_names_b.len(),
-            self.state_b.spec.src
-        );
-        println!("{} packages in common:", intersection.len());
+            .map(|x| (*x).clone())
+            .collect::<BTreeSet<Name>>();
+        println!("{} packages in lockfile A", package_names_a.len());
+        println!("{} packages in lockfile B", package_names_b.len());
+        println!("{} packages in common", intersection.len());
+        Ok(intersection)
+    }
+
+    fn run(&mut self) -> Result<(), String> {
+        let first_pass_intersection = self.add_packages_and_calculate_intesection()?;
+        println!("excluding packages outside intersection and recalculating");
+        let mut excluded_a = 0;
+        let mut excluded_b = 0;
+        for pkg in self.state_a.packages.keys().cloned().collect::<Vec<_>>() {
+            if !first_pass_intersection.contains(&pkg) {
+                excluded_a += 1;
+                self.state_a
+                    .spec
+                    .exclude_pkgs
+                    .insert(pkg.as_str().to_string());
+            }
+        }
+        for pkg in self.state_b.packages.keys().cloned().collect::<Vec<_>>() {
+            if !first_pass_intersection.contains(&pkg) {
+                excluded_b += 1;
+                self.state_b
+                    .spec
+                    .exclude_pkgs
+                    .insert(pkg.as_str().to_string());
+            }
+        }
+        println!("excluded {} more packages from lockfile A", excluded_a);
+        println!("excluded {} more packages from lockfile B", excluded_b);
+        self.state_a.phase = Phase::NameAndVersionIntersection;
+        self.state_b.phase = Phase::NameAndVersionIntersection;
+        self.state_a.packages.clear();
+        self.state_b.packages.clear();
+        let intersection = self.add_packages_and_calculate_intesection()?;
+
         let mut all_ok = true;
-        for name in intersection {
-            let vers_a = self.state_a.packages.get(*name).unwrap().version.clone();
-            let vers_b = self.state_b.packages.get(*name).unwrap().version.clone();
-            if vers_a == vers_b {
-                println!("OK {} {}", name, vers_a);
+        for name in intersection.iter() {
+            let (pkg_a, path_a) = self.state_a.packages.get(name).unwrap();
+            let (pkg_b, path_b) = self.state_b.packages.get(name).unwrap();
+            if pkg_a.version == pkg_b.version {
+                if self.state_a.verbose {
+                    println!("SAME {} {}", name, pkg_a.version);
+                }
             } else {
-                println!("DIFFERENT {} {} vs. {}", name, vers_a, vers_b);
+                println!("DIFFERENT {} {} vs. {}", name, pkg_a.version, pkg_b.version);
+                println!("  path A: {}", path_to_str(path_a));
+                println!("  path B: {}", path_to_str(path_b));
                 all_ok = false;
             }
         }
         if all_ok {
+            println!("All packages have the same versions");
             Ok(())
         } else {
             Err("Some packages have different versions".to_string())

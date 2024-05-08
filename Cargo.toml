@@ -1,11 +1,14 @@
 [package]
 name = "check-lockfile-intersection"
+description = "Tool for checking if the intersection of two Cargo.lock files have the same package versions"
+keywords = ["cargo", "lockfile", "version"]
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+authors = ["Graydon Hoare <graydon@pobox.com>"]
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 cargo-lock = "9.0.0"
 attohttpc = "0.16.0"
 url = "2.5.0"
+xflags = "0.3.2"
